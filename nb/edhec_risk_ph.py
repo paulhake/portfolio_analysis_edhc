@@ -1,6 +1,8 @@
 import pandas as pd
 import numpy as np
 import scipy.stats as sps
+from scipy.optimize import minimize
+import matplotlib.pyplot as plt
 import os
 import yfinance as yf
 
@@ -147,6 +149,57 @@ def get_ind_returns() -> pd.DataFrame:
     ind.index = pd.to_datetime(ind.index, format='%Y%m').to_period('M')
     ind.columns = ind.columns.str.strip()  # Remove any leading/trailing spaces in column names
     return ind
+
+def get_ind_sizes() -> pd.DataFrame:
+    """
+    Load and preprocess the Industry Sizes dataset.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame containing monthly market capitalizations for various industry portfolios.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the data file does not exist.
+    """
+    file_path = '../data/ind30_m_size.csv'
+
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Data file not found: {file_path}")
+
+    ind = pd.read_csv(file_path, index_col=0)
+    ind.index = pd.to_datetime(ind.index, format='%Y%m').to_period('M')
+    ind.columns = ind.columns.str.strip()  # Remove any leading/trailing spaces in column names
+    return ind
+
+def get_ind_nfirms() -> pd.DataFrame:
+    """
+    Load and preprocess the Industry Number of Firms dataset.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame containing monthly number of firms for various industry portfolios.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the data file does not exist.
+    """
+    file_path = '../data/ind30_m_nfirms.csv'
+
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Data file not found: {file_path}")
+
+    ind = pd.read_csv(file_path, index_col=0)
+    ind.index = pd.to_datetime(ind.index, format='%Y%m').to_period('M')
+    ind.columns = ind.columns.str.strip()  # Remove any leading/trailing spaces in column names
+    return ind
+
+
+
 
 def skewness(rets: pd.Series) -> float:
     """
@@ -347,32 +400,262 @@ def portfolio_return(weights, returns):
 def portfolio_vol(weights, cov):
     return (weights.T @ cov @ weights) ** 0.5
 
-def plot_ef2(n_points, er, cov, style='.-'):
+def plot_ef(n_points, er, cov, style=".-",show_cml=False, risk_free_rate=0,show_ew=False, show_gmv=False):
     """
-    Plots the 2-asset efficient frontier.
+    Plots the efficient frontier given expected returns and covariance matrix.
 
-    Parameters
-    ----------
+    Parameters:
+    -----------
     n_points : int
         Number of points to plot on the efficient frontier.
     er : pd.Series
-        Expected returns for the two assets.
+        Series of expected returns for each asset.
     cov : pd.DataFrame
-        Covariance matrix for the two assets.
-    style : str, optional
-        Matplotlib style string for the plot (default is '.-').
+        Covariance matrix of asset returns.
+    style : str
+        Matplotlib style string for the plot.
 
-    Returns
-    -------
-    None
+    Returns:
+    --------
+    matplotlib axes object
     """
-    weights = [np.array([w, 1 - w]) for w in np.linspace(0, 1, n_points)]
-    rets = [portfolio_return(w, er) for w in weights]
-    vols = [portfolio_vol(w, cov) for w in weights]
-
-    import matplotlib.pyplot as plt
+    target_rs = np.linspace(er.min(), er.max(), n_points)
+    vols = []
+    rets = []
+    for target_r in target_rs:
+        weights = minimize_vol(target_r, er, cov)
+        vol = portfolio_vol(weights, cov)
+        vols.append(vol)
+        rets.append(target_r)
     plt.plot(vols, rets, style)
     plt.xlabel("Volatility")
     plt.ylabel("Return")
-    plt.title("2-Asset Efficient Frontier")
-    plt.show()
+    plt.xlim(left=0)
+    if show_cml:
+        # Calculate the tangency portfolio
+        t_weights = msr(risk_free_rate, er, cov)
+        t_ret = portfolio_return(t_weights, er)
+        t_vol = portfolio_vol(t_weights, cov)
+        # CML line
+        cml_x = [0, t_vol]
+        cml_y = [risk_free_rate, t_ret]
+        plt.plot(cml_x, cml_y, color='green', linestyle='--', label='CML')
+        plt.plot(t_vol, t_ret, 'r*', markersize=15.0)
+        plt.annotate("MSR", xy=(t_vol, t_ret),
+            xytext=(20, -10), textcoords='offset points',
+            fontsize=12, color='red')
+        plt.legend()
+    if show_ew:
+        n = er.shape[0]
+        ew_weights = np.repeat(1/n, n)
+        ew_ret = portfolio_return(ew_weights, er)
+        ew_vol = portfolio_vol(ew_weights, cov)
+        plt.plot(ew_vol, ew_ret, 'b*', markersize=12.0)
+        plt.annotate("EW", xy=(ew_vol, ew_ret),
+            xytext=(-10, 10), textcoords='offset points',
+            fontsize=12, color='blue')
+    if show_gmv:
+        n = er.shape[0]
+        init_guess = np.repeat(1/n, n)
+        bounds = ((0.0, 1.0),) * n
+        weights_sum_to_1 = {'type': 'eq',
+                            'fun': lambda weights: np.sum(weights) - 1}
+        results = minimize(portfolio_vol, init_guess,
+                           args=(cov,), method='SLSQP',
+                           options={'disp': False},
+                           constraints=(weights_sum_to_1),
+                           bounds=bounds)
+        gmv_weights = results.x
+        gmv_ret = portfolio_return(gmv_weights, er)
+        gmv_vol = portfolio_vol(gmv_weights, cov)
+        plt.plot(gmv_vol, gmv_ret, 'm*', markersize=12.0)
+        plt.annotate("GMV", xy=(gmv_vol, gmv_ret),
+            xytext=(10, 5), textcoords='offset points',
+            fontsize=12, color='magenta')
+
+
+    return plt.gca()
+
+
+def minimize_vol(target_return, er, cov):
+    n = er.shape[0]
+    init_guess = np.repeat(1/n, n)
+    bounds = ((0.0, 1.0),) * n
+    return_is_target = {'type': 'eq',
+                        'args': (er,),
+                        'fun': lambda weights, er: target_return - portfolio_return(weights, er)}
+    weights_sum_to_1 = {'type': 'eq',
+                        'fun': lambda weights: np.sum(weights) - 1}
+    results = minimize(portfolio_vol, init_guess,
+                       args=(cov,), method='SLSQP',
+                       options={'disp': False},
+                       constraints=(return_is_target,
+                                    weights_sum_to_1),
+                       bounds=bounds)
+    return results.x
+
+def msr(risk_free_rate, er, cov):
+    n = er.shape[0]
+    init_guess = np.repeat(1/n, n)
+    bounds = ((0.0, 1.0),) * n
+    weights_sum_to_1 = {'type': 'eq',
+                        'fun': lambda weights: np.sum(weights) - 1}
+
+    def neg_sharpe_ratio(weights, cov,er, risk_free_rate=risk_free_rate):
+        r = portfolio_return(weights, er)
+        vol = portfolio_vol(weights, cov)
+        return -(r - risk_free_rate) / vol
+
+
+
+
+    results = minimize(neg_sharpe_ratio, init_guess,
+                       args=(cov,er, risk_free_rate), method='SLSQP',
+                       options={'disp': False},
+                       constraints=(weights_sum_to_1),
+                       bounds=bounds)
+    return results.x
+
+def gmv(cov):
+    """
+    Returns the weights of the Global Minimum Volatility portfolio
+    given a covariance matrix
+    """
+    n = cov.shape[0]
+    return msr(0, np.repeat(1, n), cov)
+
+def get_total_market_index_returns():
+    """
+    Calculate total market index returns based on cap-weighted industry returns.
+    
+    Returns
+    -------
+    DataFrame
+        DataFrame containing total market returns with date index
+    """
+    # Load all required data
+    ind_return = get_ind_returns()
+    ind_nfirm = get_ind_nfirms()
+    ind_size = get_ind_sizes()
+    
+    # Calculate market capitalization for each industry
+    ind_mktcap = ind_nfirm * ind_size
+    
+    # Calculate total market cap across all industries
+    total_mktcap = ind_mktcap.sum(axis=1)
+    
+    # Calculate cap weights for each industry
+    ind_capweights = ind_mktcap.div(total_mktcap, axis='rows')
+    
+    # Calculate total market return as weighted sum
+    total_market_return = (ind_capweights * ind_return).sum(axis='columns')
+    
+    # Return as DataFrame with proper column name
+    return pd.DataFrame({'TotalMarketReturn': total_market_return})
+
+def run_cppi(risky_r, safe_r=None, m=3, start=1000, floor=0.8,riskfree_rate=0.03, drawdown=None):
+    """
+    Run a backtest of the CPPI strategy, given a set of returns for the risky asset
+    Returns a dictionary containing: Asset Value History, Risk Budget History, and Risky Weight History
+    """
+    # Set up the safe asset
+    if safe_r is None:
+        safe_r = pd.DataFrame().reindex_like(risky_r)
+        safe_r[:] = riskfree_rate / 12
+    
+    # Set up some parameters
+    dates = risky_r.index
+    n_steps = len(dates)
+    account_value = start
+    floor_value = start * floor
+    peak = start
+
+    if isinstance(risky_r, pd.Series):
+        risky_r = pd.DataFrame(risky_r, columns=["R"])
+    
+    # Set up DataFrames for saving intermediate values
+    account_history = pd.DataFrame().reindex_like(risky_r)
+    cushion_history = pd.DataFrame().reindex_like(risky_r)
+    risky_w_history = pd.DataFrame().reindex_like(risky_r)
+    
+    for step in range(n_steps):
+        if drawdown is not None:
+            peak = np.maximum(peak, account_value)
+            floor_value = peak * (1 - drawdown)
+        cushion = (account_value - floor_value) / account_value
+        risky_w = m * cushion
+        risky_w = np.minimum(risky_w, 1)  # cap risky weight at 100%
+        risky_w = np.maximum(risky_w, 0)  # floor risky weight at 0%
+        safe_w = 1 - risky_w
+        risky_alloc = account_value * risky_w
+        safe_alloc = account_value * safe_w
+        
+        # recompute the account value based on the returns
+        account_value = risky_alloc * (1 + risky_r.iloc[step]) + safe_alloc * (1 + safe_r.iloc[step])
+        
+        # store history
+        account_history.iloc[step] = account_value
+        cushion_history.iloc[step] = cushion
+        risky_w_history.iloc[step] = risky_w
+
+    risky_wealth = start * (1 + risky_r).cumprod()
+
+    return {
+        "Wealth": account_history,
+        "Risky Wealth": risky_wealth,
+        "Risk Budget": cushion_history,
+        "Risky Weight": risky_w_history,
+        "m": m,
+        "start": start,
+        "floor": floor,
+        "risky_r": risky_r,
+        "safe_r": safe_r
+    }
+
+
+
+def summary_stats(r, riskfree_rate=0.03):
+    """
+    Return a DataFrame that contains aggregated summary stats for the returns in the columns of r
+    """
+    ann_r = r.aggregate(annualize_rets, periods_per_year=12)
+    ann_vol = r.aggregate(annualize_vol, periods_per_year=12)
+    ann_sr = r.aggregate(sharpe_ratio, riskfree_rate=riskfree_rate, periods_per_year=12)
+    dd = r.aggregate(lambda r: drawdown(r).Drawdown.min())
+    skew = r.aggregate(skewness)
+    kurt = r.aggregate(kurtosis)
+    cf_var5 = r.aggregate(var_gaussian, modified=True)
+    hist_cvar5 = r.aggregate(cvar_historic)
+    return pd.DataFrame({
+        "Annualized Return": ann_r,
+        "Annualized Vol": ann_vol,
+        "Skewness": skew,
+        "Kurtosis": kurt,
+        "Cornish-Fisher VaR (5%)": cf_var5,
+        "Historic CVaR (5%)": hist_cvar5,
+        "Sharpe Ratio": ann_sr,
+        "Max Drawdown": dd
+    })
+
+def gbm(n_years = 10, n_scenarios=1000, mu=0.07, sigma=0.15, steps_per_year=12, s0=100.0, prices=True):
+    """
+    Evolution of Geometric Brownian Motion trajectories, such as for Stock Prices through Monte Carlo
+    :param n_years:  The number of years to generate data for
+    :param n_paths: The number of scenarios/trajectories
+    :param mu: Annualized Drift, e.g. Market Return
+    :param sigma: Annualized Volatility
+    :param steps_per_year: granularity of the simulation
+    :param s_0: initial value
+    :return: a numpy array of n_paths columns and n_years*steps_per_year rows
+    """
+    # Derive per-step Model Parameters from User Specifications
+    dt = 1/steps_per_year
+    n_steps = int(n_years*steps_per_year) + 1
+    # the standard way ...
+    # rets_plus_1 = np.random.normal(loc=mu*dt+1, scale=sigma*np.sqrt(dt), size=(n_steps, n_scenarios))
+    # without discretization error ...
+    rets_plus_1 = np.random.normal(loc=(1+mu)**dt, scale=(sigma*np.sqrt(dt)), size=(n_steps, n_scenarios))
+    rets_plus_1[0] = 1
+    ret_val = s0*pd.DataFrame(rets_plus_1).cumprod() if prices else rets_plus_1-1
+    return ret_val
+
