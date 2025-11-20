@@ -5,6 +5,7 @@ from scipy.optimize import minimize
 import matplotlib.pyplot as plt
 import os
 import yfinance as yf
+import ipywidgets as widgets
 
 
 def get_from_yahoo(tickers, period='10y'):
@@ -659,3 +660,30 @@ def gbm(n_years = 10, n_scenarios=1000, mu=0.07, sigma=0.15, steps_per_year=12, 
     ret_val = s0*pd.DataFrame(rets_plus_1).cumprod() if prices else rets_plus_1-1
     return ret_val
 
+def show_cppi(n_scenarios=50, mu=0.07, sigma=0.15, m=3, floor=0., riskfree_rate=0.03, y_max=100):
+    """
+    Plot the results of a Monte Carlo Simulation of CPPI
+    """
+    start = 100
+    sim_rets = gbm(n_scenarios=n_scenarios, mu=mu, sigma=sigma, prices=False, steps_per_year=12)
+    risky_r = pd.DataFrame(sim_rets)
+    # run the "back"-test
+    btr = run_cppi(risky_r=pd.DataFrame(risky_r),riskfree_rate=riskfree_rate,m=m, start=start, floor=floor)
+    wealth = btr["Wealth"]
+    y_max=wealth.values.max()*y_max/100
+    ax = wealth.plot(legend=False, alpha=0.3, color="indianred", figsize=(12, 6))
+    ax.axhline(y=start, ls=":", color="black")
+    ax.axhline(y=start*floor, ls="--", color="red")
+    ax.set_ylim(top=y_max)
+
+    cppi_controls = widgets.interactive(show_cppi, 
+                                   n_scenarios=widgets.IntSlider(min=1, max=1000, step=5, value=50), 
+                                   mu=(0., +.2, .01),
+                                   sigma=(0, .30, .05),
+                                   floor=(0, 2, .1),
+                                   m=(1, 5, .5),
+                                   riskfree_rate=(0, .05, .01),
+                                   y_max=widgets.IntSlider(min=0, max=100, step=1, value=100,
+                                                          description="Zoom Y Axis")
+                                                          
+                                        )
