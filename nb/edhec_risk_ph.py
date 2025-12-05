@@ -4,8 +4,8 @@ import scipy.stats as sps
 from scipy.optimize import minimize
 import matplotlib.pyplot as plt
 import os
+import math
 import yfinance as yf
-import ipywidgets as widgets
 
 
 def get_from_yahoo(tickers, period='10y'):
@@ -244,7 +244,6 @@ def var_historic(r, level=5):
     """Returns the historic VaR at a specified level"""
     if isinstance(r, pd.DataFrame):
         return r.aggregate(lambda x: var_historic(x, level=level))
-        #return r.aggregate(var_historic(r, level=level))
     elif isinstance(r, pd.Series):
         return -np.percentile(r, level)
     else:
@@ -502,16 +501,16 @@ def msr(risk_free_rate, er, cov):
     weights_sum_to_1 = {'type': 'eq',
                         'fun': lambda weights: np.sum(weights) - 1}
 
-    def neg_sharpe_ratio(weights, cov,er, risk_free_rate=risk_free_rate):
+    def neg_sharpe_ratio(weights, cov, er, rfr):
         r = portfolio_return(weights, er)
         vol = portfolio_vol(weights, cov)
-        return -(r - risk_free_rate) / vol
+        return -(r - rfr) / vol
 
 
 
 
     results = minimize(neg_sharpe_ratio, init_guess,
-                       args=(cov,er, risk_free_rate), method='SLSQP',
+                       args=(cov, er, risk_free_rate), method='SLSQP',
                        options={'disp': False},
                        constraints=(weights_sum_to_1),
                        bounds=bounds)
@@ -546,10 +545,10 @@ def get_total_market_index_returns():
     total_mktcap = ind_mktcap.sum(axis=1)
     
     # Calculate cap weights for each industry
-    ind_capweights = ind_mktcap.div(total_mktcap, axis='rows')
-    
+    ind_capweights = ind_mktcap.div(total_mktcap, axis=0)
+
     # Calculate total market return as weighted sum
-    total_market_return = (ind_capweights * ind_return).sum(axis='columns')
+    total_market_return = (ind_capweights * ind_return).sum(axis=1)
     
     # Return as DataFrame with proper column name
     return pd.DataFrame({'TotalMarketReturn': total_market_return})
@@ -675,15 +674,139 @@ def show_cppi(n_scenarios=50, mu=0.07, sigma=0.15, m=3, floor=0., riskfree_rate=
     ax.axhline(y=start, ls=":", color="black")
     ax.axhline(y=start*floor, ls="--", color="red")
     ax.set_ylim(top=y_max)
+    
+def discount(t, r):
+    """
+    Compute the price of a pure discount bond that pays a dollar at time period t
+    and r is the per-period interest rate
+    returns a |t| x |r| Series or DataFrame
+    r can be a float, Series or DataFrame
+    returns a DataFrame indexed by t
+    """
+    discounts = pd.DataFrame([(r+1)**-i for i in t])
+    discounts.index = t
+    return discounts
 
-    cppi_controls = widgets.interactive(show_cppi, 
-                                   n_scenarios=widgets.IntSlider(min=1, max=1000, step=5, value=50), 
-                                   mu=(0., +.2, .01),
-                                   sigma=(0, .30, .05),
-                                   floor=(0, 2, .1),
-                                   m=(1, 5, .5),
-                                   riskfree_rate=(0, .05, .01),
-                                   y_max=widgets.IntSlider(min=0, max=100, step=1, value=100,
-                                                          description="Zoom Y Axis")
-                                                          
-                                        )
+def pv(flows, r):
+    """
+    Compute the present value of a sequence of cash flows given by the time (as an index) and amounts
+    r can be a scalar, or a Series or DataFrame with the number of rows matching the num of rows in flows
+    """
+    dates = flows.index
+    discounts = discount(dates, r)
+    return discounts.multiply(flows, axis=0).sum()
+
+def funding_ratio(assets, liabilities, r):
+    """
+    Computes the funding ratio of a series of liabilities, based on an interest rate and current value of assets
+    """
+    return pv(assets, r)/pv(liabilities, r)
+
+def inst_to_ann(r):
+    """
+    Convert an instantaneous interest rate to an annual interest rate
+    """
+    return np.expm1(r)
+
+def ann_to_inst(r):
+    """
+    Convert an annual interest rate to an instantaneous interest rate
+    """
+    return np.log1p(r)
+
+def cir(n_years = 10, n_scenarios=1, a=0.05, b=0.03, sigma=0.05, steps_per_year=12, r_0=None):
+    """
+    Generate random interest rate evolution over time using the CIR model
+    b and r_0 are assumed to be the annualized rates, not the short rate
+    and the returned values are the annualized rates as well
+    """
+    if r_0 is None: r_0 = b 
+    r_0 = ann_to_inst(r_0)
+    dt = 1/steps_per_year
+    num_steps = int(n_years*steps_per_year) + 1 # because n_years might be a float
+    
+    shock = np.random.normal(0, scale=np.sqrt(dt), size=(num_steps, n_scenarios))
+    rates = np.empty_like(shock)
+    rates[0] = r_0
+
+    ## For Price Generation
+    h = math.sqrt(a**2 + 2*sigma**2)
+    prices = np.empty_like(shock)
+    ####
+
+    def price(ttm, r):
+        _A = ((2*h*math.exp((h+a)*ttm/2))/(2*h+(h+a)*(math.exp(h*ttm)-1)))**(2*a*b/sigma**2)
+        _B = (2*(math.exp(h*ttm)-1))/(2*h + (h+a)*(math.exp(h*ttm)-1))
+        _P = _A*np.exp(-_B*r)
+        return _P
+    prices[0] = price(n_years, r_0)
+    ####
+    
+    for step in range(1, num_steps):
+        r_t = rates[step-1]
+        d_r_t = a*(b-r_t)*dt + sigma*np.sqrt(r_t)*shock[step]
+        rates[step] = abs(r_t + d_r_t)
+        # generate prices at time t as well ...
+        prices[step] = price(n_years-step*dt, rates[step])
+
+    rates = pd.DataFrame(data=inst_to_ann(rates), index=range(num_steps))
+    ### for prices
+    prices = pd.DataFrame(data=prices, index=range(num_steps))
+    ###
+    return rates, prices
+
+
+def bond_cash_flows(maturity, principal=100, coupon_rate=0.03, coupons_per_year=12):
+    """
+    Returns the series of cash flows generated by a bond,
+    indexed by the payment/coupon number
+    """
+    n_coupons = round(maturity*coupons_per_year)
+    coupon_amt = principal*coupon_rate/coupons_per_year
+    coupons = np.repeat(coupon_amt, n_coupons)
+    coupon_times = np.arange(1, n_coupons+1)
+    cash_flows = pd.Series(data=coupon_amt, index=coupon_times)
+    cash_flows.iloc[-1] += principal
+    return cash_flows
+    
+def bond_price(maturity, principal=100, coupon_rate=0.03, coupons_per_year=12, discount_rate=0.03):
+    """
+    Computes the price of a bond that pays regular coupons until maturity
+    at which time the principal and the final coupon is returned
+    This is not designed to be efficient, rather,
+    it is to illustrate the underlying principle behind bond pricing!
+    If discount_rate is a DataFrame, then this is assumed to be the rate on each coupon date
+    and the bond value is computed over time.
+    i.e. The index of the discount_rate DataFrame is assumed to be the coupon number
+    """
+    if isinstance(discount_rate, pd.DataFrame):
+        pricing_dates = discount_rate.index
+        prices = pd.DataFrame(index=pricing_dates, columns=discount_rate.columns)
+        for t in pricing_dates:
+            prices.loc[t] = bond_price(maturity-t/coupons_per_year, principal, coupon_rate, coupons_per_year,
+                                      discount_rate.loc[t])
+        return prices
+    else: # base case ... single time period
+        if maturity <= 0: return principal+principal*coupon_rate/coupons_per_year
+        cash_flows = bond_cash_flows(maturity, principal, coupon_rate, coupons_per_year)
+        return pv(cash_flows, discount_rate/coupons_per_year)
+    
+def macaulay_duration(flows, discount_rate):
+    """
+    Computes the Macaulay Duration of a sequence of cash flows, given a per-period discount rate
+    """
+    discounted_flows = discount(flows.index, discount_rate)*pd.DataFrame(flows)
+    weights = discounted_flows/discounted_flows.sum()
+    return np.average(flows.index, weights=weights.iloc[:,0])
+
+def match_durations(cf_t, cf_s, cf_l, discount_rate):
+    """
+    Returns the weight W in cf_s that, along with (1-W) in cf_l will have an effective
+    duration that matches cf_t
+    """
+    d_t = macaulay_duration(cf_t, discount_rate)
+    d_s = macaulay_duration(cf_s, discount_rate)
+    d_l = macaulay_duration(cf_l, discount_rate)
+    return (d_l - d_t)/(d_l - d_s)
+
+
